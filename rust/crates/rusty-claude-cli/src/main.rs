@@ -52,6 +52,8 @@ use runtime::{
 };
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
+use time::macros::format_description;
+use time::OffsetDateTime;
 use tools::{GlobalToolRegistry, RuntimeToolDefinition, ToolSearchOutput};
 
 const DEFAULT_MODEL: &str = "claude-opus-4-6";
@@ -62,9 +64,9 @@ fn max_tokens_for_model(model: &str) -> u32 {
         64_000
     }
 }
-const DEFAULT_DATE: &str = "2026-03-31";
 const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 4545;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+const BUILD_DATE: Option<&str> = option_env!("BUILD_DATE");
 const BUILD_TARGET: Option<&str> = option_env!("TARGET");
 const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
 const INTERNAL_PROGRESS_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(3);
@@ -757,6 +759,26 @@ fn config_permission_mode_for_current_dir() -> Option<PermissionMode> {
         .map(permission_mode_from_resolved)
 }
 
+fn current_date_string() -> String {
+    let now = OffsetDateTime::now_local().unwrap_or_else(|_| OffsetDateTime::now_utc());
+    now.format(&format_description!("[year]-[month]-[day]"))
+        .expect("date format should be valid")
+}
+
+fn discover_project_context(
+    cwd: &Path,
+    date: impl Into<String>,
+) -> Result<ProjectContext, Box<dyn std::error::Error>> {
+    Ok(ProjectContext::discover(cwd, date.into())?)
+}
+
+fn discover_project_context_with_git(
+    cwd: &Path,
+    date: impl Into<String>,
+) -> Result<ProjectContext, Box<dyn std::error::Error>> {
+    Ok(ProjectContext::discover_with_git(cwd, date.into())?)
+}
+
 fn filter_tool_specs(
     tool_registry: &GlobalToolRegistry,
     allowed_tools: Option<&AllowedToolSet>,
@@ -769,7 +791,7 @@ fn parse_system_prompt_args(
     output_format: CliOutputFormat,
 ) -> Result<CliAction, String> {
     let mut cwd = env::current_dir().map_err(|error| error.to_string())?;
-    let mut date = DEFAULT_DATE.to_string();
+    let mut date = current_date_string();
     let mut index = 0;
 
     while index < args.len() {
@@ -998,11 +1020,17 @@ fn render_diagnostic_check(check: &DiagnosticCheck) -> String {
 }
 
 fn render_doctor_report() -> Result<DoctorReport, Box<dyn std::error::Error>> {
+    render_doctor_report_for_date(current_date_string())
+}
+
+fn render_doctor_report_for_date(
+    date: impl Into<String>,
+) -> Result<DoctorReport, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let config_loader = ConfigLoader::default_for(&cwd);
     let config = config_loader.load();
     let discovered_config = config_loader.discover();
-    let project_context = ProjectContext::discover_with_git(&cwd, DEFAULT_DATE)?;
+    let project_context = discover_project_context_with_git(&cwd, date)?;
     let (project_root, git_branch) =
         parse_git_status_metadata(project_context.git_status.as_deref());
     let git_summary = parse_git_workspace_summary(project_context.git_status.as_deref());
@@ -4089,11 +4117,18 @@ fn status_json_value(
 fn status_context(
     session_path: Option<&Path>,
 ) -> Result<StatusContext, Box<dyn std::error::Error>> {
+    status_context_for_date(session_path, current_date_string())
+}
+
+fn status_context_for_date(
+    session_path: Option<&Path>,
+    date: impl Into<String>,
+) -> Result<StatusContext, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
     let loader = ConfigLoader::default_for(&cwd);
     let discovered_config_files = loader.discover().len();
     let runtime_config = loader.load()?;
-    let project_context = ProjectContext::discover_with_git(&cwd, DEFAULT_DATE)?;
+    let project_context = discover_project_context_with_git(&cwd, date)?;
     let (project_root, git_branch) =
         parse_git_status_metadata(project_context.git_status.as_deref());
     let git_summary = parse_git_workspace_summary(project_context.git_status.as_deref());
@@ -4387,8 +4422,14 @@ fn render_config_report(section: Option<&str>) -> Result<String, Box<dyn std::er
 }
 
 fn render_memory_report() -> Result<String, Box<dyn std::error::Error>> {
+    render_memory_report_for_date(current_date_string())
+}
+
+fn render_memory_report_for_date(
+    date: impl Into<String>,
+) -> Result<String, Box<dyn std::error::Error>> {
     let cwd = env::current_dir()?;
-    let project_context = ProjectContext::discover(&cwd, DEFAULT_DATE)?;
+    let project_context = discover_project_context(&cwd, date)?;
     let mut lines = vec![format!(
         "Memory
   Working directory {}
@@ -4754,10 +4795,11 @@ fn parse_titled_body(value: &str) -> Option<(String, String)> {
 }
 
 fn render_version_report() -> String {
+    let build_date = BUILD_DATE.unwrap_or("unknown");
     let git_sha = GIT_SHA.unwrap_or("unknown");
     let target = BUILD_TARGET.unwrap_or("unknown");
     format!(
-        "Claw Code\n  Version          {VERSION}\n  Git SHA          {git_sha}\n  Target           {target}\n  Build date       {DEFAULT_DATE}"
+        "Claw Code\n  Version          {VERSION}\n  Git SHA          {git_sha}\n  Target           {target}\n  Build date       {build_date}"
     )
 }
 
@@ -4849,9 +4891,15 @@ fn resolve_export_path(
 }
 
 fn build_system_prompt() -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    build_system_prompt_with_date(current_date_string())
+}
+
+fn build_system_prompt_with_date(
+    date: impl Into<String>,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     Ok(load_system_prompt(
         env::current_dir()?,
-        DEFAULT_DATE,
+        date,
         env::consts::OS,
         "unknown",
     )?)
@@ -6622,7 +6670,8 @@ fn print_help(output_format: CliOutputFormat) -> Result<(), Box<dyn std::error::
 mod tests {
     use super::{
         build_runtime_plugin_state_with_loader, build_runtime_with_plugin_state,
-        create_managed_session_handle, describe_tool_progress, filter_tool_specs,
+        build_system_prompt_with_date, create_managed_session_handle, describe_tool_progress,
+        discover_project_context, discover_project_context_with_git, filter_tool_specs,
         format_bughunter_report, format_commit_preflight_report, format_commit_skipped_report,
         format_compact_report, format_cost_report, format_internal_prompt_progress_line,
         format_issue_report, format_model_report, format_model_switch_report,
@@ -7045,6 +7094,52 @@ mod tests {
                 output_format: CliOutputFormat::Text,
             }
         );
+    }
+
+    #[test]
+    fn system_prompt_defaults_to_runtime_date_when_not_overridden() {
+        let args = vec!["system-prompt".to_string()];
+        let parsed = parse_args(&args).expect("args should parse");
+        let date = match parsed {
+            CliAction::PrintSystemPrompt { date, .. } => date,
+            other => panic!("expected system prompt action, got {other:?}"),
+        };
+        assert_ne!(date, "2026-03-31");
+        assert_eq!(date.len(), 10);
+        assert_eq!(&date[4..5], "-");
+        assert_eq!(&date[7..8], "-");
+    }
+
+    #[test]
+    fn injected_date_flows_into_system_prompt() {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("root dir");
+
+        let sections = with_current_dir(&root, || {
+            build_system_prompt_with_date("2040-01-02").expect("system prompt should build")
+        });
+        let rendered = sections.join("\n\n");
+
+        assert!(rendered.contains("Date: 2040-01-02"));
+        assert!(rendered.contains("Today's date is 2040-01-02."));
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn injected_date_flows_into_project_context_discovery() {
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("root dir");
+
+        let context = discover_project_context(&root, "2041-06-07")
+            .expect("project context should discover");
+        assert_eq!(context.current_date, "2041-06-07");
+
+        let git_context = discover_project_context_with_git(&root, "2041-06-07")
+            .expect("project context with git should discover");
+        assert_eq!(git_context.current_date, "2041-06-07");
+
+        fs::remove_dir_all(root).expect("cleanup temp dir");
     }
 
     #[test]
