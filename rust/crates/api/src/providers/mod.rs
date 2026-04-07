@@ -171,10 +171,16 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
         });
     }
 
-    // Default to OpenAI provider for any other model names (e.g. Qwen, DeepSeek, Llama, etc.)
+    // Support SiliconFlow specifically if the model looks like it, or default to generic OpenAI
+    let auth_env = if lower.contains("qwen") || lower.contains("deepseek") {
+        "SILICONFLOW_API_KEY"
+    } else {
+        "OPENAI_API_KEY"
+    };
+
     Some(ProviderMetadata {
         provider: ProviderKind::OpenAi,
-        auth_env: "OPENAI_API_KEY",
+        auth_env,
         base_url_env: "OPENAI_BASE_URL",
         default_base_url: openai_compat::DEFAULT_OPENAI_BASE_URL,
     })
