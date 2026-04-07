@@ -154,7 +154,7 @@ pub fn resolve_model_alias(model: &str) -> String {
 pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
     let canonical = resolve_model_alias(model);
     let lower = canonical.to_ascii_lowercase();
-    if canonical.starts_with("claude") {
+    if lower.contains("claude") {
         return Some(ProviderMetadata {
             provider: ProviderKind::Anthropic,
             auth_env: "ANTHROPIC_API_KEY",
@@ -162,7 +162,7 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             default_base_url: anthropic::DEFAULT_BASE_URL,
         });
     }
-    if canonical.starts_with("grok") {
+    if lower.contains("grok") {
         return Some(ProviderMetadata {
             provider: ProviderKind::Xai,
             auth_env: "XAI_API_KEY",
@@ -170,15 +170,14 @@ pub fn metadata_for_model(model: &str) -> Option<ProviderMetadata> {
             default_base_url: openai_compat::DEFAULT_XAI_BASE_URL,
         });
     }
-    if lower.starts_with("qwen") {
-        return Some(ProviderMetadata {
-            provider: ProviderKind::OpenAi,
-            auth_env: "OPENAI_API_KEY",
-            base_url_env: "OPENAI_BASE_URL",
-            default_base_url: openai_compat::DEFAULT_OPENAI_BASE_URL,
-        });
-    }
-    None
+
+    // Default to OpenAI provider for any other model names (e.g. Qwen, DeepSeek, Llama, etc.)
+    Some(ProviderMetadata {
+        provider: ProviderKind::OpenAi,
+        auth_env: "OPENAI_API_KEY",
+        base_url_env: "OPENAI_BASE_URL",
+        default_base_url: openai_compat::DEFAULT_OPENAI_BASE_URL,
+    })
 }
 
 #[must_use]
