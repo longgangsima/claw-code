@@ -26,8 +26,8 @@ use std::time::{Duration, Instant, UNIX_EPOCH};
 use api::{
     oauth_token_is_expired, resolve_startup_auth_source, AnthropicClient, AuthSource,
     ContentBlockDelta, InputContentBlock, InputMessage, MessageRequest, MessageResponse,
-    OutputContentBlock, PromptCache, StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition,
-    ToolResultContentBlock,
+    OutputContentBlock, PromptCache, ProviderClient, StreamEvent as ApiStreamEvent, ToolChoice,
+    ToolDefinition, ToolResultContentBlock,
 };
 
 use commands::{
@@ -97,6 +97,7 @@ type RuntimePluginStateBuildOutput = (
 );
 
 fn main() {
+    load_dotenv();
     if let Err(error) = run() {
         let message = error.to_string();
         if message.contains("`claw --help`") {
@@ -167,6 +168,67 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::Help { output_format } => print_help(output_format)?,
     }
     Ok(())
+}
+
+fn load_dotenv() {
+    let Ok(cwd) = env::current_dir() else {
+        return;
+    };
+    let path = cwd.join(".env");
+    let Ok(contents) = fs::read_to_string(path) else {
+        return;
+    };
+    for line in contents.lines().filter_map(parse_dotenv_line) {
+        if env::var_os(&line.key).is_none() {
+            env::set_var(line.key, line.value);
+        }
+    }
+}
+
+struct DotenvLine {
+    key: String,
+    value: String,
+}
+
+fn parse_dotenv_line(line: &str) -> Option<DotenvLine> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return None;
+    }
+    let assignment = trimmed.strip_prefix("export ").unwrap_or(trimmed);
+    let (key, raw_value) = assignment.split_once('=')?;
+    let key = key.trim();
+    if key.is_empty()
+        || !key
+            .chars()
+            .all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    Some(DotenvLine {
+        key: key.to_string(),
+        value: unquote_dotenv_value(raw_value.trim()),
+    })
+}
+
+fn unquote_dotenv_value(value: &str) -> String {
+    if let Some(unquoted) = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+    {
+        unquoted.replace("\\n", "\n").replace("\\\"", "\"")
+    } else if let Some(unquoted) = value
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+    {
+        unquoted.to_string()
+    } else {
+        value
+            .split_once(" #")
+            .map_or(value, |(value, _comment)| value)
+            .trim()
+            .to_string()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -268,7 +330,7 @@ impl CliOutputFormat {
 
 #[allow(clippy::too_many_lines)]
 fn parse_args(args: &[String]) -> Result<CliAction, String> {
-    let mut model = DEFAULT_MODEL.to_string();
+    let mut model = default_model();
     let mut output_format = CliOutputFormat::Text;
     let mut permission_mode_override = None;
     let mut wants_help = false;
@@ -688,6 +750,17 @@ fn resolve_model_alias(model: &str) -> &str {
     }
 }
 
+fn default_model() -> String {
+    env::var("CLAW_MODEL")
+        .ok()
+        .map(|model| model.trim().to_string())
+        .filter(|model| !model.is_empty())
+        .map_or_else(
+            || DEFAULT_MODEL.to_string(),
+            |model| resolve_model_alias(&model).to_string(),
+        )
+}
+
 fn normalize_allowed_tools(values: &[String]) -> Result<Option<AllowedToolSet>, String> {
     if values.is_empty() {
         return Ok(None);
@@ -740,13 +813,23 @@ fn permission_mode_from_resolved(mode: ResolvedPermissionMode) -> PermissionMode
 }
 
 fn default_permission_mode() -> PermissionMode {
-    env::var("RUSTY_CLAUDE_PERMISSION_MODE")
-        .ok()
-        .as_deref()
-        .and_then(normalize_permission_mode)
+    env_permission_mode()
         .map(permission_mode_from_label)
         .or_else(config_permission_mode_for_current_dir)
         .unwrap_or(PermissionMode::DangerFullAccess)
+}
+
+fn env_permission_mode() -> Option<&'static str> {
+    env::var("CLAW_PERMISSION_MODE")
+        .ok()
+        .as_deref()
+        .and_then(normalize_permission_mode)
+        .or_else(|| {
+            env::var("RUSTY_CLAUDE_PERMISSION_MODE")
+                .ok()
+                .as_deref()
+                .and_then(normalize_permission_mode)
+        })
 }
 
 fn config_permission_mode_for_current_dir() -> Option<PermissionMode> {
@@ -2444,7 +2527,7 @@ struct RuntimeMcpState {
 }
 
 struct BuiltRuntime {
-    runtime: Option<ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>>,
+    runtime: Option<ConversationRuntime<ProviderRuntimeClient, CliToolExecutor>>,
     plugin_registry: PluginRegistry,
     plugins_active: bool,
     mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
@@ -2453,7 +2536,7 @@ struct BuiltRuntime {
 
 impl BuiltRuntime {
     fn new(
-        runtime: ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>,
+        runtime: ConversationRuntime<ProviderRuntimeClient, CliToolExecutor>,
         plugin_registry: PluginRegistry,
         mcp_state: Option<Arc<Mutex<RuntimeMcpState>>>,
     ) -> Self {
@@ -2498,7 +2581,7 @@ impl BuiltRuntime {
 }
 
 impl Deref for BuiltRuntime {
-    type Target = ConversationRuntime<AnthropicRuntimeClient, CliToolExecutor>;
+    type Target = ConversationRuntime<ProviderRuntimeClient, CliToolExecutor>;
 
     fn deref(&self) -> &Self::Target {
         self.runtime
@@ -5361,7 +5444,7 @@ fn build_runtime_with_plugin_state(
         .map_err(std::io::Error::other)?;
     let mut runtime = ConversationRuntime::new_with_features(
         session,
-        AnthropicRuntimeClient::new(
+        ProviderRuntimeClient::new(
             session_id,
             model,
             enable_tools,
@@ -5468,9 +5551,9 @@ impl runtime::PermissionPrompter for CliPermissionPrompter {
     }
 }
 
-struct AnthropicRuntimeClient {
+struct ProviderRuntimeClient {
     runtime: tokio::runtime::Runtime,
-    client: AnthropicClient,
+    client: ProviderClient,
     session_id: String,
     model: String,
     enable_tools: bool,
@@ -5480,7 +5563,7 @@ struct AnthropicRuntimeClient {
     progress_reporter: Option<InternalPromptProgressReporter>,
 }
 
-impl AnthropicRuntimeClient {
+impl ProviderRuntimeClient {
     fn new(
         session_id: &str,
         model: String,
@@ -5492,9 +5575,7 @@ impl AnthropicRuntimeClient {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         Ok(Self {
             runtime: tokio::runtime::Runtime::new()?,
-            client: AnthropicClient::from_auth(resolve_cli_auth_source()?)
-                .with_base_url(api::read_base_url())
-                .with_prompt_cache(PromptCache::new(session_id)),
+            client: provider_client_for_model(&model, session_id)?,
             session_id: session_id.to_string(),
             model,
             enable_tools,
@@ -5506,17 +5587,35 @@ impl AnthropicRuntimeClient {
     }
 }
 
+fn provider_client_for_model(
+    model: &str,
+    session_id: &str,
+) -> Result<ProviderClient, Box<dyn std::error::Error>> {
+    let resolved_model = api::resolve_model_alias(model);
+    let client = match api::detect_provider_kind(&resolved_model) {
+        api::ProviderKind::Anthropic => ProviderClient::from_model_with_anthropic_auth(
+            &resolved_model,
+            Some(resolve_cli_auth_source()?),
+        )?,
+        api::ProviderKind::OpenAi | api::ProviderKind::Xai => {
+            ProviderClient::from_model(&resolved_model)?
+        }
+    };
+    Ok(client.with_prompt_cache(PromptCache::new(session_id)))
+}
+
 fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
-    Ok(resolve_startup_auth_source(|| {
+    let source = resolve_startup_auth_source(|| {
         let cwd = env::current_dir().map_err(api::ApiError::from)?;
         let config = ConfigLoader::default_for(&cwd).load().map_err(|error| {
             api::ApiError::Auth(format!("failed to load runtime OAuth config: {error}"))
         })?;
         Ok(config.oauth().cloned())
-    })?)
+    })?;
+    Ok(source)
 }
 
-impl ApiClient for AnthropicRuntimeClient {
+impl ApiClient for ProviderRuntimeClient {
     #[allow(clippy::too_many_lines)]
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
         if let Some(progress_reporter) = &self.progress_reporter {
@@ -6317,7 +6416,7 @@ fn response_to_events(
     Ok(events)
 }
 
-fn push_prompt_cache_record(client: &AnthropicClient, events: &mut Vec<AssistantEvent>) {
+fn push_prompt_cache_record(client: &ProviderClient, events: &mut Vec<AssistantEvent>) {
     if let Some(record) = client.take_last_prompt_cache_record() {
         if let Some(event) = prompt_cache_record_to_runtime_event(record) {
             events.push(AssistantEvent::PromptCache(event));
@@ -6819,6 +6918,52 @@ mod tests {
         }
     }
 
+    #[test]
+    fn load_dotenv_sets_missing_environment_variables() {
+        let _env_guard = env_lock();
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("root dir");
+        fs::write(
+            root.join(".env"),
+            "OPENAI_BASE_URL=https://api.siliconflow.cn/v1\nCLAW_MODEL=Qwen/Qwen3-Coder-480B-A35B-Instruct\n",
+        )
+        .expect("write dotenv");
+        std::env::remove_var("OPENAI_BASE_URL");
+        std::env::remove_var("CLAW_MODEL");
+
+        with_current_dir(&root, super::load_dotenv);
+
+        assert_eq!(
+            std::env::var("OPENAI_BASE_URL").expect("base url should load"),
+            "https://api.siliconflow.cn/v1"
+        );
+        assert_eq!(
+            std::env::var("CLAW_MODEL").expect("model should load"),
+            "Qwen/Qwen3-Coder-480B-A35B-Instruct"
+        );
+        std::env::remove_var("OPENAI_BASE_URL");
+        std::env::remove_var("CLAW_MODEL");
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
+    #[test]
+    fn load_dotenv_does_not_override_existing_environment_variables() {
+        let _env_guard = env_lock();
+        let root = temp_dir();
+        fs::create_dir_all(&root).expect("root dir");
+        fs::write(root.join(".env"), "CLAW_MODEL=from-dotenv\n").expect("write dotenv");
+        std::env::set_var("CLAW_MODEL", "from-shell");
+
+        with_current_dir(&root, super::load_dotenv);
+
+        assert_eq!(
+            std::env::var("CLAW_MODEL").expect("model should remain set"),
+            "from-shell"
+        );
+        std::env::remove_var("CLAW_MODEL");
+        fs::remove_dir_all(root).expect("cleanup temp dir");
+    }
+
     fn write_plugin_fixture(root: &Path, name: &str, include_hooks: bool, include_lifecycle: bool) {
         fs::create_dir_all(root.join(".claude-plugin")).expect("manifest dir");
         if include_hooks {
@@ -6864,6 +7009,7 @@ mod tests {
     #[test]
     fn defaults_to_repl_when_no_args() {
         let _guard = env_lock();
+        std::env::remove_var("CLAW_MODEL");
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
         assert_eq!(
             parse_args(&[]).expect("args should parse"),
@@ -6873,6 +7019,22 @@ mod tests {
                 permission_mode: PermissionMode::DangerFullAccess,
             }
         );
+    }
+
+    #[test]
+    fn claw_model_env_sets_default_model_for_repl() {
+        let _guard = env_lock();
+        std::env::set_var("CLAW_MODEL", "Qwen/Qwen3-Coder-480B-A35B-Instruct");
+        std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
+        assert_eq!(
+            parse_args(&[]).expect("args should parse"),
+            CliAction::Repl {
+                model: "Qwen/Qwen3-Coder-480B-A35B-Instruct".to_string(),
+                allowed_tools: None,
+                permission_mode: PermissionMode::DangerFullAccess,
+            }
+        );
+        std::env::remove_var("CLAW_MODEL");
     }
 
     #[test]
@@ -6890,8 +7052,10 @@ mod tests {
         .expect("project config should write");
 
         let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_claw_permission_mode = std::env::var("CLAW_PERMISSION_MODE").ok();
         let original_permission_mode = std::env::var("RUSTY_CLAUDE_PERMISSION_MODE").ok();
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::remove_var("CLAW_PERMISSION_MODE");
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
 
         let resolved = with_current_dir(&cwd, super::default_permission_mode);
@@ -6899,6 +7063,10 @@ mod tests {
         match original_config_home {
             Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
             None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_claw_permission_mode {
+            Some(value) => std::env::set_var("CLAW_PERMISSION_MODE", value),
+            None => std::env::remove_var("CLAW_PERMISSION_MODE"),
         }
         match original_permission_mode {
             Some(value) => std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", value),
@@ -6924,8 +7092,10 @@ mod tests {
         .expect("project config should write");
 
         let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_claw_permission_mode = std::env::var("CLAW_PERMISSION_MODE").ok();
         let original_permission_mode = std::env::var("RUSTY_CLAUDE_PERMISSION_MODE").ok();
         std::env::set_var("CLAW_CONFIG_HOME", &config_home);
+        std::env::remove_var("CLAW_PERMISSION_MODE");
         std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", "read-only");
 
         let resolved = with_current_dir(&cwd, super::default_permission_mode);
@@ -6933,6 +7103,10 @@ mod tests {
         match original_config_home {
             Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
             None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_claw_permission_mode {
+            Some(value) => std::env::set_var("CLAW_PERMISSION_MODE", value),
+            None => std::env::remove_var("CLAW_PERMISSION_MODE"),
         }
         match original_permission_mode {
             Some(value) => std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", value),
@@ -6944,8 +7118,31 @@ mod tests {
     }
 
     #[test]
+    fn claw_permission_mode_env_overrides_legacy_permission_mode() {
+        let _guard = env_lock();
+        let original_claw_permission_mode = std::env::var("CLAW_PERMISSION_MODE").ok();
+        let original_permission_mode = std::env::var("RUSTY_CLAUDE_PERMISSION_MODE").ok();
+        std::env::set_var("CLAW_PERMISSION_MODE", "workspace-write");
+        std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", "read-only");
+
+        let resolved = super::default_permission_mode();
+
+        match original_claw_permission_mode {
+            Some(value) => std::env::set_var("CLAW_PERMISSION_MODE", value),
+            None => std::env::remove_var("CLAW_PERMISSION_MODE"),
+        }
+        match original_permission_mode {
+            Some(value) => std::env::set_var("RUSTY_CLAUDE_PERMISSION_MODE", value),
+            None => std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE"),
+        }
+
+        assert_eq!(resolved, PermissionMode::WorkspaceWrite);
+    }
+
+    #[test]
     fn parses_prompt_subcommand() {
         let _guard = env_lock();
+        std::env::remove_var("CLAW_MODEL");
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
         let args = vec![
             "prompt".to_string(),
@@ -6967,6 +7164,7 @@ mod tests {
     #[test]
     fn parses_bare_prompt_and_json_output_flag() {
         let _guard = env_lock();
+        std::env::remove_var("CLAW_MODEL");
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
         let args = vec![
             "--output-format=json".to_string(),
@@ -6990,6 +7188,7 @@ mod tests {
     #[test]
     fn resolves_model_aliases_in_args() {
         let _guard = env_lock();
+        std::env::remove_var("CLAW_MODEL");
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
         let args = vec![
             "--model".to_string(),
@@ -7019,6 +7218,8 @@ mod tests {
 
     #[test]
     fn parses_version_flags_without_initializing_prompt_mode() {
+        let _guard = env_lock();
+        std::env::remove_var("CLAW_MODEL");
         assert_eq!(
             parse_args(&["--version".to_string()]).expect("args should parse"),
             CliAction::Version {
@@ -7035,6 +7236,8 @@ mod tests {
 
     #[test]
     fn parses_permission_mode_flag() {
+        let _guard = env_lock();
+        std::env::remove_var("CLAW_MODEL");
         let args = vec!["--permission-mode=read-only".to_string()];
         assert_eq!(
             parse_args(&args).expect("args should parse"),
@@ -7049,6 +7252,7 @@ mod tests {
     #[test]
     fn parses_allowed_tools_flags_with_aliases_and_lists() {
         let _guard = env_lock();
+        std::env::remove_var("CLAW_MODEL");
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
         let args = vec![
             "--allowedTools".to_string(),
@@ -7131,8 +7335,8 @@ mod tests {
         let root = temp_dir();
         fs::create_dir_all(&root).expect("root dir");
 
-        let context = discover_project_context(&root, "2041-06-07")
-            .expect("project context should discover");
+        let context =
+            discover_project_context(&root, "2041-06-07").expect("project context should discover");
         assert_eq!(context.current_date, "2041-06-07");
 
         let git_context = discover_project_context_with_git(&root, "2041-06-07")
@@ -7221,6 +7425,7 @@ mod tests {
     #[test]
     fn parses_single_word_command_aliases_without_falling_back_to_prompt_mode() {
         let _guard = env_lock();
+        std::env::remove_var("CLAW_MODEL");
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
         assert_eq!(
             parse_args(&["help".to_string()]).expect("help should parse"),
@@ -7284,6 +7489,7 @@ mod tests {
     #[test]
     fn multi_word_prompt_still_uses_shorthand_prompt_mode() {
         let _guard = env_lock();
+        std::env::remove_var("CLAW_MODEL");
         std::env::remove_var("RUSTY_CLAUDE_PERMISSION_MODE");
         assert_eq!(
             parse_args(&["help".to_string(), "me".to_string(), "debug".to_string()])
