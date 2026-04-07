@@ -5605,13 +5605,14 @@ fn provider_client_for_model(
 }
 
 fn resolve_cli_auth_source() -> Result<AuthSource, Box<dyn std::error::Error>> {
-    Ok(resolve_startup_auth_source(|| {
+    let source = resolve_startup_auth_source(|| {
         let cwd = env::current_dir().map_err(api::ApiError::from)?;
         let config = ConfigLoader::default_for(&cwd).load().map_err(|error| {
             api::ApiError::Auth(format!("failed to load runtime OAuth config: {error}"))
         })?;
         Ok(config.oauth().cloned())
-    })?)
+    })?;
+    Ok(source)
 }
 
 impl ApiClient for ProviderRuntimeClient {
