@@ -23,17 +23,38 @@ impl ProviderClient {
         anthropic_auth: Option<AuthSource>,
     ) -> Result<Self, ApiError> {
         let resolved_model = providers::resolve_model_alias(model);
-        match providers::detect_provider_kind(&resolved_model) {
+        let metadata = providers::metadata_for_model(&resolved_model);
+
+        match metadata
+            .map(|m| m.provider)
+            .unwrap_or_else(|| providers::detect_provider_kind(&resolved_model))
+        {
             ProviderKind::Anthropic => Ok(Self::Anthropic(match anthropic_auth {
                 Some(auth) => AnthropicClient::from_auth(auth),
                 None => AnthropicClient::from_env()?,
             })),
-            ProviderKind::Xai => Ok(Self::Xai(OpenAiCompatClient::from_env(
-                OpenAiCompatConfig::xai(),
-            )?)),
-            ProviderKind::OpenAi => Ok(Self::OpenAi(OpenAiCompatClient::from_env(
-                OpenAiCompatConfig::openai(),
-            )?)),
+            ProviderKind::Xai => {
+                let config = metadata
+                    .map(|m| OpenAiCompatConfig {
+                        provider_name: "xAI",
+                        api_key_env: m.auth_env,
+                        base_url_env: m.base_url_env,
+                        default_base_url: m.default_base_url,
+                    })
+                    .unwrap_or_else(OpenAiCompatConfig::xai);
+                Ok(Self::Xai(OpenAiCompatClient::from_env(config)?))
+            }
+            ProviderKind::OpenAi => {
+                let config = metadata
+                    .map(|m| OpenAiCompatConfig {
+                        provider_name: "OpenAI",
+                        api_key_env: m.auth_env,
+                        base_url_env: m.base_url_env,
+                        default_base_url: m.default_base_url,
+                    })
+                    .unwrap_or_else(OpenAiCompatConfig::openai);
+                Ok(Self::OpenAi(OpenAiCompatClient::from_env(config)?))
+            }
         }
     }
 
