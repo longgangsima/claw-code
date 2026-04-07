@@ -1,5 +1,6 @@
 __pycache__/
 archive/
+.env
 .omx/
 .clawd-agents/
 # Claude Code local artifacts
